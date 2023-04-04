@@ -84,6 +84,7 @@ impl PingPong {
         Some(UserPings(user_pings))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn ping_shutdown(&mut self) {
         assert!(self.pending_ping.is_none());
 
