@@ -148,6 +148,12 @@ impl GoAway {
 }
 
 impl GoingAway {
+    // PATCH(denoland): lets the graceful-shutdown grace timer tell the
+    // advisory GOAWAY apart from a definitive or error one.
+    pub(crate) fn last_processed_id(&self) -> StreamId {
+        self.last_processed_id
+    }
+
     pub(crate) fn reason(&self) -> Reason {
         self.reason
     }

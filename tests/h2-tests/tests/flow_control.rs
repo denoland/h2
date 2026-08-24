@@ -2802,7 +2802,9 @@ async fn too_many_window_update_resets_causes_go_away() {
     join(srv, client).await;
 }
 
-#[tokio::test]
+// PATCH(denoland): paused clock, so the graceful-shutdown grace period
+// elapses instantly once the connection is otherwise idle.
+#[tokio::test(start_paused = true)]
 async fn goaway_ignores_data_but_returns_connection_capacity() {
     h2_support::trace_init!();
 
