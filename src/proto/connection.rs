@@ -7,12 +7,21 @@ use crate::proto::*;
 
 use bytes::Bytes;
 use futures_core::Stream;
+use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::AsyncRead;
+
+/// PATCH(denoland): how long a gracefully-shutting-down server keeps
+/// accepting new streams between the shutdown ping ack and the
+/// definitive GOAWAY. Upstream sends the definitive GOAWAY as soon as
+/// the ping is acked (~1 RTT after the advisory GOAWAY), which drops
+/// streams that race the shutdown; many HTTP/2 clients (hyper, Node's
+/// http2 module) surface those as errors instead of retrying them.
+const GRACEFUL_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// An H2 connection
 #[derive(Debug)]
@@ -48,6 +57,12 @@ where
     /// Ping/pong handler
     ping_pong: PingPong,
 
+    /// PATCH(denoland): armed when the shutdown ping is acked; the
+    /// definitive GOAWAY is sent when it elapses. Polled in the
+    /// `Poll::Pending` branch of `Connection::poll`, so its waker is
+    /// registered on the same poll that received the pong.
+    goaway_grace: Option<Pin<Box<tokio::time::Sleep>>>,
+
     /// Connection settings
     settings: Settings,
 
@@ -71,6 +86,9 @@ struct DynConnection<'a, B: Buf = Bytes> {
     error: &'a mut Option<frame::GoAway>,
 
     ping_pong: &'a mut PingPong,
+
+    // PATCH(denoland): see `ConnectionInner::goaway_grace`.
+    goaway_grace: &'a mut Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +175,7 @@ where
                 error: None,
                 go_away: GoAway::new(),
                 ping_pong: PingPong::new(),
+                goaway_grace: None,
                 settings: Settings::new(config.settings),
                 streams,
                 span,
@@ -316,6 +335,39 @@ where
                                 continue;
                             }
 
+                            // PATCH(denoland): graceful shutdown, second
+                            // phase. Once the shutdown ping is acked, wait
+                            // out the grace period — during which new
+                            // streams are still accepted and served — then
+                            // send the definitive GOAWAY: from that point
+                            // new streams are refused, in-flight streams
+                            // run to completion, and the connection closes
+                            // once idle. The timer is polled here, right
+                            // before the connection would go to sleep, so
+                            // its waker is always registered.
+                            if let Some(grace) = self.inner.goaway_grace.as_mut() {
+                                if grace.as_mut().poll(cx).is_ready() {
+                                    self.inner.goaway_grace = None;
+                                    // Send the definitive GOAWAY only if the
+                                    // advisory one is still the last word; an
+                                    // error or user-initiated GOAWAY queued
+                                    // during the grace window must not be
+                                    // clobbered.
+                                    let advisory =
+                                        self.inner.go_away.going_away().is_some_and(|g| {
+                                            g.last_processed_id() == StreamId::MAX
+                                                && g.reason() == Reason::NO_ERROR
+                                        });
+                                    if advisory && !self.inner.go_away.should_close_now() {
+                                        let mut dyn_conn = self.inner.as_dyn();
+                                        let last_processed_id =
+                                            dyn_conn.streams.last_processed_id();
+                                        dyn_conn.go_away(last_processed_id, Reason::NO_ERROR);
+                                        continue;
+                                    }
+                                }
+                            }
+
                             return Poll::Pending;
                         }
                     };
@@ -405,6 +457,7 @@ where
             streams,
             error,
             ping_pong,
+            goaway_grace,
             ..
         } = self;
         let streams = streams.as_dyn();
@@ -414,6 +467,7 @@ where
             streams,
             error,
             ping_pong,
+            goaway_grace,
         }
     }
 }
@@ -578,8 +632,14 @@ where
                         "received unexpected shutdown ping"
                     );
 
-                    let last_processed_id = self.streams.last_processed_id();
-                    self.go_away(last_processed_id, Reason::NO_ERROR);
+                    // PATCH(denoland): don't send the definitive GOAWAY
+                    // yet — arm the grace timer instead; `Connection::poll`
+                    // sends the GOAWAY once it elapses (see
+                    // GRACEFUL_SHUTDOWN_GRACE).
+                    if self.goaway_grace.is_none() {
+                        *self.goaway_grace =
+                            Some(Box::pin(tokio::time::sleep(GRACEFUL_SHUTDOWN_GRACE)));
+                    }
                 }
             }
             Some(WindowUpdate(frame)) => {

@@ -727,7 +727,9 @@ async fn abrupt_shutdown() {
     join(client, srv).await;
 }
 
-#[tokio::test]
+// PATCH(denoland): paused clock, so the graceful-shutdown grace period
+// elapses instantly once the connection is otherwise idle.
+#[tokio::test(start_paused = true)]
 async fn graceful_shutdown() {
     h2_support::trace_init!();
     let (io, mut client) = mock::new();
@@ -757,8 +759,20 @@ async fn graceful_shutdown() {
         client
             .send_frame(frames::ping(frame::Ping::SHUTDOWN).pong())
             .await;
-        client.recv_frame(frames::go_away(3)).await;
-        // streams sent after GOAWAY receive no response
+        // PATCH(denoland): the definitive GOAWAY is delayed by a grace
+        // period after the pong; streams begun in the window are served.
+        client
+            .send_frame(
+                frames::headers(5)
+                    .request("GET", "https://example.com/")
+                    .eos(),
+            )
+            .await;
+        client
+            .recv_frame(frames::headers(5).response(200).eos())
+            .await;
+        client.recv_frame(frames::go_away(5)).await;
+        // streams sent after the definitive GOAWAY receive no response
         client
             .send_frame(frames::headers(7).request("GET", "https://example.com/"))
             .await;
@@ -793,6 +807,12 @@ async fn graceful_shutdown() {
         };
 
         let mut srv = Box::pin(async move {
+            // PATCH(denoland): the stream begun during the grace window.
+            let (req, mut stream) = srv.next().await.unwrap().unwrap();
+            assert_eq!(req.method(), &http::Method::GET);
+            let rsp = http::Response::builder().status(200).body(()).unwrap();
+            stream.send_response(rsp, true).unwrap();
+
             assert!(srv.next().await.is_none(), "unexpected request");
         });
         srv.drive(body).await;
@@ -1835,4 +1855,87 @@ async fn remote_reset_does_not_panic_connection_driver() {
         .await
         .expect("server task timed out")
         .expect("server task panicked");
+}
+
+// PATCH(denoland): a connection that goes fully idle after acking the
+// shutdown ping must still get the definitive GOAWAY once the grace
+// period elapses, and then close. This uses a raw byte-level client
+// over tokio::io::duplex rather than the mock harness: the mock can
+// generate spurious wakes that would mask a grace timer whose waker
+// was never registered.
+#[tokio::test(start_paused = true)]
+async fn graceful_shutdown_idle_connection() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    h2_support::trace_init!();
+    let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+    let srv = async move {
+        let mut srv = server::handshake(server_io).await.expect("handshake");
+        srv.graceful_shutdown();
+        assert!(srv.next().await.is_none(), "unexpected request");
+    };
+
+    let client = async move {
+        async fn read_frame(
+            io: &mut (impl tokio::io::AsyncRead + Unpin),
+        ) -> Option<(u8, u8, Vec<u8>)> {
+            let mut head = [0u8; 9];
+            match io.read_exact(&mut head).await {
+                Ok(_) => {}
+                // Connection closed between frames.
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
+                Err(e) => panic!("read frame header: {}", e),
+            }
+            let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+            let mut payload = vec![0u8; len];
+            io.read_exact(&mut payload).await.unwrap();
+            Some((head[3], head[4], payload))
+        }
+
+        client_io
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .unwrap();
+        // Empty client SETTINGS.
+        client_io
+            .write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+
+        let mut go_aways = Vec::new();
+        while let Some((kind, flags, payload)) = read_frame(&mut client_io).await {
+            match kind {
+                // Server SETTINGS: ack it.
+                4 if flags & 1 == 0 => {
+                    client_io
+                        .write_all(&[0, 0, 0, 4, 1, 0, 0, 0, 0])
+                        .await
+                        .unwrap();
+                }
+                // PING: ack it, then stay completely idle.
+                6 if flags & 1 == 0 => {
+                    let mut ack = vec![0, 0, 8, 6, 1, 0, 0, 0, 0];
+                    ack.extend_from_slice(&payload);
+                    client_io.write_all(&ack).await.unwrap();
+                }
+                // GOAWAY: record the last-stream-id.
+                7 => {
+                    let last = u32::from_be_bytes([
+                        payload[0], payload[1], payload[2], payload[3],
+                    ]) & 0x7fff_ffff;
+                    go_aways.push(last);
+                }
+                _ => {}
+            }
+        }
+        // Advisory GOAWAY, then — after the grace period — the
+        // definitive one, then the server closes the connection.
+        assert_eq!(go_aways, vec![2147483647, 0]);
+    };
+
+    tokio::time::timeout(Duration::from_secs(60), join(client, srv))
+        .await
+        .expect("graceful shutdown hung on an idle connection");
 }

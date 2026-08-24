@@ -540,9 +540,11 @@ where
     /// Must continue being polled to close connection.
     ///
     /// It's possible to receive more requests after calling this method, since
-    /// they might have been in-flight from the client already. After about
-    /// 1 RTT, no new requests should be accepted. Once all active streams
-    /// have completed, the connection is closed.
+    /// they might have been in-flight from the client already. New requests
+    /// keep being accepted during a grace period of about 1 RTT plus 5
+    /// seconds (PATCH(denoland); upstream allows only ~1 RTT), after which
+    /// no new requests are accepted. Once all active streams have completed,
+    /// the connection is closed.
     ///
     /// [1]: http://httpwg.org/specs/rfc7540.html#GOAWAY
     pub fn graceful_shutdown(&mut self) {
