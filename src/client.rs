@@ -1364,9 +1364,9 @@ where
                 remote_reset_stream_max: builder.pending_accept_reset_stream_max,
                 local_error_reset_streams_max: builder.local_max_error_reset_streams,
                 settings: builder.settings,
-                data_frame_budget: builder
-                    .data_frame_budget
-                    .resolve(builder.initial_target_connection_window_size),
+                data_frame_budget: builder.data_frame_budget,
+                initial_target_connection_window_size: builder
+                    .initial_target_connection_window_size,
             },
         );
         let send_request = SendRequest {

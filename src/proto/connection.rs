@@ -101,7 +101,11 @@ pub(crate) struct Config {
     pub remote_reset_stream_max: usize,
     pub local_error_reset_streams_max: Option<usize>,
     pub settings: frame::Settings,
-    pub data_frame_budget: usize,
+    /// How the connection-level DATA framing overhead budget is sized.
+    pub data_frame_budget: DataFrameBudget,
+    /// Target connection window an `Auto` budget is derived from. `None`
+    /// means the peer never configured one, so the protocol default applies.
+    pub initial_target_connection_window_size: Option<WindowSize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -163,6 +167,7 @@ where
                     .map(|max| max as usize),
                 local_max_error_reset_streams: config.local_error_reset_streams_max,
                 data_frame_budget: config.data_frame_budget,
+                initial_target_connection_window_size: config.initial_target_connection_window_size,
             }
         }
         let streams = Streams::new(streams_config(&config));
@@ -185,6 +190,14 @@ where
     }
 
     /// connection flow control
+    ///
+    /// PATCH(denoland): this also re-sizes an `Auto` DATA framing overhead
+    /// budget, which would otherwise stay pinned to the window the
+    /// connection was built with. Callers that autotune the connection
+    /// window at runtime -- hyper's `adaptive_window`, which hands h2 the
+    /// 64 KiB spec minimum up front and then grows the target from BDP
+    /// samples -- would otherwise run every connection on the smallest
+    /// budget `Auto` can resolve, no matter how large the window grows.
     pub(crate) fn set_target_window_size(&mut self, size: WindowSize) {
         let _res = self.inner.streams.set_target_connection_window_size(size);
         // TODO: proper error handling

@@ -122,6 +122,10 @@ where
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
 
+        // PATCH(denoland): keep an `Auto` DATA framing overhead budget in
+        // step with the window it is derived from.
+        me.counts.set_target_connection_window(size);
+
         me.actions
             .recv
             .set_target_connection_window(size, &mut me.actions.task)
