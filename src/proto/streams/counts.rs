@@ -145,12 +145,30 @@ impl Counts {
                 .checked_add(1)
                 .ok_or(BudgetExhausted)?;
             if self.num_recv_empty_data_frames > MAX_RECV_EMPTY_DATA_FRAMES {
+                // PATCH(denoland): the two exhaustion paths share an error and
+                // a GOAWAY payload, so without distinct warn-level logs an
+                // operator cannot tell which rule killed a connection — the
+                // frame sizes only ever appear at debug level. One line per
+                // connection kill, so this cannot spam.
+                tracing::warn!(
+                    limit = MAX_RECV_EMPTY_DATA_FRAMES,
+                    "empty DATA frame limit exceeded; killing connection with ENHANCE_YOUR_CALM",
+                );
                 return Err(BudgetExhausted);
             }
             Ok(())
         } else if payload_len < DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD {
+            let budget = self.data_frame_budget.max;
             self.data_frame_budget
                 .consume(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD - payload_len)
+                .inspect_err(|_| {
+                    // PATCH(denoland): see above.
+                    tracing::warn!(
+                        budget,
+                        payload_len,
+                        "small DATA frame budget exhausted; killing connection with ENHANCE_YOUR_CALM",
+                    );
+                })
         } else {
             self.data_frame_budget
                 .replenish(payload_len - DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD);
