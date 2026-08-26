@@ -1318,7 +1318,8 @@ mod tests {
             remote_init_window_sz: DEFAULT_INITIAL_WINDOW_SIZE,
             remote_max_initiated: None,
             local_max_error_reset_streams: None,
-            data_frame_budget: DEFAULT_DATA_FRAME_BUDGET,
+            data_frame_budget: DataFrameBudget::Auto,
+            initial_target_connection_window_size: None,
         };
         let mut recv = Recv::new(peer::Dyn::Server, &config);
         let mut store = Store::new();

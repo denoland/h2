@@ -79,10 +79,13 @@ pub struct Config {
     /// When this gets exceeded, we issue GOAWAYs.
     pub local_max_error_reset_streams: Option<usize>,
 
-    /// connection-level budget (in bytes) for DATA framing overhead.
-    ///
-    /// Default 25600 bytes
-    pub data_frame_budget: usize,
+    /// How the connection-level budget (in bytes) for DATA framing overhead
+    /// is sized. An `Auto` budget follows the target connection window; see
+    /// `Counts::set_target_connection_window`.
+    pub data_frame_budget: DataFrameBudget,
+
+    /// Target connection window the `Auto` budget is first derived from.
+    pub initial_target_connection_window_size: Option<WindowSize>,
 }
 
 trait DebugStructExt<'a, 'b> {

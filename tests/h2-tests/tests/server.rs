@@ -1922,9 +1922,8 @@ async fn graceful_shutdown_idle_connection() {
                 }
                 // GOAWAY: record the last-stream-id.
                 7 => {
-                    let last = u32::from_be_bytes([
-                        payload[0], payload[1], payload[2], payload[3],
-                    ]) & 0x7fff_ffff;
+                    let last = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+                        & 0x7fff_ffff;
                     go_aways.push(last);
                 }
                 _ => {}

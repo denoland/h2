@@ -25,6 +25,20 @@ impl Budget {
     fn replenish(&mut self, amount: usize) {
         self.available = self.available.saturating_add(amount).min(self.max);
     }
+
+    /// PATCH(denoland): raises the ceiling, crediting what was added to the
+    /// available balance.
+    ///
+    /// Grow-only on purpose: a peer that shrinks its window mid-connection
+    /// must not retroactively exhaust a budget an honest sender has already
+    /// spent against, which a plain reset would do.
+    fn grow_to(&mut self, max: usize) {
+        if max <= self.max {
+            return;
+        }
+        self.available = self.available.saturating_add(max - self.max);
+        self.max = max;
+    }
 }
 
 #[derive(Debug)]
@@ -70,6 +84,10 @@ pub(super) struct Counts {
     /// connection-level budget for DATA framing overhead.
     data_frame_budget: Budget,
 
+    /// PATCH(denoland): how `data_frame_budget` is sized, kept so an `Auto`
+    /// budget can be re-derived when the target connection window changes.
+    data_frame_budget_mode: DataFrameBudget,
+
     /// Number of empty, non-final DATA frames received over the lifetime of
     /// the connection.
     num_recv_empty_data_frames: usize,
@@ -90,8 +108,32 @@ impl Counts {
             num_remote_reset_streams: 0,
             max_local_error_reset_streams: config.local_max_error_reset_streams,
             num_local_error_reset_streams: 0,
-            data_frame_budget: Budget::new(config.data_frame_budget),
+            data_frame_budget: Budget::new(
+                config
+                    .data_frame_budget
+                    .resolve(config.initial_target_connection_window_size),
+            ),
+            data_frame_budget_mode: config.data_frame_budget,
             num_recv_empty_data_frames: 0,
+        }
+    }
+
+    /// PATCH(denoland): re-derives an `Auto` DATA framing overhead budget
+    /// from the new target connection window.
+    ///
+    /// `Auto` is documented as scaling with the connection window, but it is
+    /// resolved once from the window the connection was built with. A server
+    /// that autotunes the window afterwards -- hyper's `adaptive_window`
+    /// starts every connection at the 64 KiB spec minimum and grows the
+    /// target from BDP samples -- would otherwise be stuck on the smallest
+    /// budget `Auto` can produce for the life of the connection.
+    ///
+    /// A `Configured` budget is left alone: it is an explicit choice, not a
+    /// function of the window.
+    pub fn set_target_connection_window(&mut self, size: WindowSize) {
+        if let DataFrameBudget::Auto = self.data_frame_budget_mode {
+            self.data_frame_budget
+                .grow_to(DataFrameBudget::Auto.resolve(Some(size)));
         }
     }
 
@@ -370,7 +412,8 @@ mod tests {
                 remote_init_window_sz: DEFAULT_INITIAL_WINDOW_SIZE,
                 remote_max_initiated: None,
                 local_max_error_reset_streams: None,
-                data_frame_budget: DEFAULT_DATA_FRAME_BUDGET,
+                data_frame_budget: DataFrameBudget::Auto,
+                initial_target_connection_window_size: None,
             },
         )
     }
@@ -382,6 +425,22 @@ mod tests {
         budget.consume(4).unwrap();
         budget.replenish(20);
         assert_eq!(budget.available, 10);
+    }
+
+    #[test]
+    fn budget_grow_to_credits_the_difference() {
+        let mut budget = Budget::new(10);
+        budget.consume(10).unwrap();
+
+        budget.grow_to(30);
+        assert_eq!(budget.max, 30);
+        assert_eq!(budget.available, 20);
+
+        // Shrinking is a no-op, so an already-spent balance is never
+        // retroactively overdrawn.
+        budget.grow_to(5);
+        assert_eq!(budget.max, 30);
+        assert_eq!(budget.available, 20);
     }
 
     #[test]
@@ -440,5 +499,59 @@ mod tests {
                 .unwrap();
         }
         assert!(counts.record_data_frame(0).is_err());
+    }
+
+    #[test]
+    fn auto_data_frame_budget_follows_target_connection_window() {
+        let mut counts = counts();
+        assert_eq!(
+            counts.data_frame_budget.max,
+            DEFAULT_INITIAL_WINDOW_SIZE as usize / 2
+        );
+
+        // Spend the starting budget one minimum-size frame at a time. This
+        // is the shape of a proxied upload whose chunks arrive smaller than
+        // the overhead threshold.
+        let per_frame = DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD - 1;
+        let frames = counts.data_frame_budget.available / per_frame;
+        for _ in 0..frames {
+            counts.record_data_frame(1).unwrap();
+        }
+
+        // Growing the connection window has to grow the budget with it,
+        // otherwise a connection that started at the spec minimum stays on
+        // the smallest budget Auto can resolve however large the window
+        // gets, and the next small frame kills the whole connection.
+        counts.set_target_connection_window(1024 * 1024);
+        assert_eq!(counts.data_frame_budget.max, 512 * 1024);
+        for _ in 0..frames {
+            counts.record_data_frame(1).unwrap();
+        }
+    }
+
+    #[test]
+    fn auto_data_frame_budget_does_not_shrink_with_the_window() {
+        let mut counts = counts();
+        counts.set_target_connection_window(1024 * 1024);
+        counts.record_data_frame(1).unwrap();
+
+        counts.set_target_connection_window(DEFAULT_INITIAL_WINDOW_SIZE);
+
+        assert_eq!(counts.data_frame_budget.max, 512 * 1024);
+        assert_eq!(
+            counts.data_frame_budget.available,
+            512 * 1024 - (DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD - 1)
+        );
+    }
+
+    #[test]
+    fn configured_data_frame_budget_ignores_target_connection_window() {
+        let mut counts = counts();
+        counts.data_frame_budget_mode = DataFrameBudget::Configured(1024);
+        counts.data_frame_budget = Budget::new(1024);
+
+        counts.set_target_connection_window(1024 * 1024);
+
+        assert_eq!(counts.data_frame_budget.max, 1024);
     }
 }

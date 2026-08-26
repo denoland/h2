@@ -1535,10 +1535,10 @@ where
                                 .builder
                                 .local_max_error_reset_streams,
                             settings: self.builder.settings.clone(),
-                            data_frame_budget: self
+                            data_frame_budget: self.builder.data_frame_budget,
+                            initial_target_connection_window_size: self
                                 .builder
-                                .data_frame_budget
-                                .resolve(self.builder.initial_target_connection_window_size),
+                                .initial_target_connection_window_size,
                         },
                     );
 
